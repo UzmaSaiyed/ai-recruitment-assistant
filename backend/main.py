@@ -1,6 +1,7 @@
 """
-Day 1 goal: prove that FastAPI + Supabase + Gemini are all connected and working.
-Nothing fancy yet — just test endpoints.
+AI Recruitment & Document Assistant — FastAPI backend.
+Handles resume/JD upload, parsing, embeddings, vector search,
+LLM-based scoring, and a RAG chat assistant.
 """
 
 import os
@@ -16,13 +17,13 @@ load_dotenv()
 
 app = FastAPI(title="AI Recruitment Assistant")
 
-# --- Connect to Supabase ---
+# Connect to Supabase
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
 
-# --- Connect to Gemini ---
+# Connect to Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 
@@ -106,9 +107,7 @@ def test_gemini_chat():
         return {"status": "error", "message": str(e)}
 
 
-# ============================================================
-# DAY 2: Upload endpoints
-# ============================================================
+# Upload endpoints (JD + resumes)
 
 @app.post("/upload-job")
 async def upload_job(title: str = Form(...), file: UploadFile = File(...)):
@@ -194,9 +193,7 @@ def list_resumes(job_id: str):
         return {"status": "error", "message": str(e)}
 
 
-# ============================================================
-# DAY 3: Embeddings & Vector Search
-# ============================================================
+# Embeddings & vector search
 
 @app.post("/embed-job/{job_id}")
 def embed_job(job_id: str):
@@ -278,5 +275,244 @@ def search(job_id: str, query: str, top_k: int = 5):
         }).execute()
 
         return {"status": "success", "results": result.data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# LLM scoring & ranking engine
+
+import json
+
+SCORING_PROMPT_TEMPLATE = """You are an expert technical recruiter. Compare the candidate's resume
+against the job description and evaluate their fit.
+
+JOB DESCRIPTION:
+{jd_text}
+
+CANDIDATE RESUME:
+{resume_text}
+
+Respond with ONLY a valid JSON object (no markdown, no extra text) in this exact format:
+{{
+  "score": <integer from 0 to 100>,
+  "matched_skills": ["skill1", "skill2"],
+  "gaps": ["missing skill or requirement 1", "missing skill or requirement 2"],
+  "reasoning": "A 2-3 sentence explanation of why this candidate received this score."
+}}"""
+
+
+def score_resume_with_llm(jd_text: str, resume_text: str) -> dict:
+    """Sends the JD + one resume to Gemini and gets back a structured score."""
+    model = genai.GenerativeModel(
+        "gemini-3.6-flash",
+        generation_config={"response_mime_type": "application/json"}
+    )
+    prompt = SCORING_PROMPT_TEMPLATE.format(jd_text=jd_text, resume_text=resume_text)
+    response = model.generate_content(prompt)
+    return json.loads(response.text)
+
+
+@app.post("/score-resumes/{job_id}")
+def score_resumes(job_id: str):
+    """
+    Scores every resume linked to this job against the JD.
+    Run this after uploading the JD + resumes (embeddings not required for this step).
+    """
+    try:
+        job = supabase.table("jobs").select("raw_text").eq("id", job_id).execute()
+        if not job.data:
+            return {"status": "error", "message": "Job not found"}
+        jd_text = job.data[0]["raw_text"]
+
+        resumes = supabase.table("resumes").select("id, filename, raw_text").eq("job_id", job_id).execute()
+        if not resumes.data:
+            return {"status": "error", "message": "No resumes found for this job"}
+
+        results = []
+        for resume in resumes.data:
+            try:
+                score_data = score_resume_with_llm(jd_text, resume["raw_text"])
+
+                supabase.table("scores").insert({
+                    "job_id": job_id,
+                    "resume_id": resume["id"],
+                    "score": score_data["score"],
+                    "matched_skills": score_data["matched_skills"],
+                    "gaps": score_data["gaps"],
+                    "reasoning": score_data["reasoning"]
+                }).execute()
+
+                results.append({
+                    "filename": resume["filename"],
+                    "status": "success",
+                    "score": score_data["score"]
+                })
+            except Exception as e:
+                results.append({"filename": resume["filename"], "status": "error", "message": str(e)})
+
+        return {"status": "success", "scored": results}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/ranked/{job_id}")
+def ranked_candidates(job_id: str):
+    """
+    Returns all scored candidates for this job, sorted from best to worst match.
+    This is the "shortlist" view.
+    """
+    try:
+        result = supabase.table("scores") \
+            .select("score, matched_skills, gaps, reasoning, resumes(filename, candidate_name)") \
+            .eq("job_id", job_id) \
+            .order("score", desc=True) \
+            .execute()
+
+        return {"status": "success", "ranked_candidates": result.data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# RAG chat assistant
+
+CHAT_PROMPT_TEMPLATE = """You are a helpful recruiting assistant. Answer the recruiter's question
+using ONLY the resume excerpts provided below. If the excerpts don't contain enough
+information to answer confidently, say so honestly instead of guessing.
+
+Always mention which candidate(s) your answer is based on, using their filename.
+
+RESUME EXCERPTS:
+{context}
+
+RECRUITER'S QUESTION:
+{question}
+
+Give a clear, concise answer (2-5 sentences), citing the relevant candidate filename(s)."""
+
+
+@app.post("/chat")
+def chat(job_id: str = Form(...), question: str = Form(...), top_k: int = Form(6)):
+    """
+    The RAG chat endpoint. Retrieves the most relevant resume chunks for this
+    question, then asks Gemini to answer using only that retrieved context.
+
+    Example question: "Which candidates have 3+ years of React experience?"
+    """
+    try:
+        # Step 1: retrieve relevant chunks (same vector search used by /search)
+        query_embedding = get_embedding(question)
+        retrieved = supabase.rpc("match_resume_chunks", {
+            "query_embedding": query_embedding,
+            "match_job_id": job_id,
+            "match_count": top_k
+        }).execute()
+
+        if not retrieved.data:
+            return {"status": "error", "message": "No resume data found for this job. Run /embed-resumes first."}
+
+        # Step 2: build context string from retrieved chunks, labeled by candidate
+        context_parts = []
+        for chunk in retrieved.data:
+            context_parts.append(f"[{chunk['filename']}]: {chunk['chunk_text']}")
+        context = "\n\n".join(context_parts)
+
+        # Step 3: ask Gemini to answer using only that context
+        model = genai.GenerativeModel("gemini-3.6-flash")
+        prompt = CHAT_PROMPT_TEMPLATE.format(context=context, question=question)
+        response = model.generate_content(prompt)
+        answer = response.text
+
+        # Step 4: save this Q&A to chat_history for later review
+        supabase.table("chat_history").insert({
+            "job_id": job_id,
+            "question": question,
+            "answer": answer
+        }).execute()
+
+        # Return the answer plus which sources were used (for transparency)
+        sources = list({chunk["filename"] for chunk in retrieved.data})
+        return {
+            "status": "success",
+            "answer": answer,
+            "sources": sources
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/chat-history/{job_id}")
+def chat_history(job_id: str):
+    """See all previous questions asked for this job (for quick testing/review)."""
+    try:
+        result = supabase.table("chat_history") \
+            .select("question, answer, created_at") \
+            .eq("job_id", job_id) \
+            .order("created_at", desc=True) \
+            .execute()
+        return {"status": "success", "history": result.data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# Shortlist report generation
+
+REPORT_PROMPT_TEMPLATE = """You are a recruiting assistant writing a shortlist summary report
+for a hiring manager. Below is the job description and a list of ranked candidates
+with their scores and evaluation notes.
+
+JOB DESCRIPTION:
+{jd_text}
+
+RANKED CANDIDATES:
+{candidates_text}
+
+Write a clean, professional shortlist report with:
+1. A short intro (1-2 sentences) summarizing the role and how many candidates were evaluated.
+2. A ranked list of the top candidates, each with their score, key strengths, and any notable gaps.
+3. A brief closing recommendation on who to prioritize for interviews and why.
+
+Keep the tone professional and concise, as if this will be read by a hiring manager."""
+
+
+@app.get("/generate-report/{job_id}")
+def generate_report(job_id: str, top_n: int = 5):
+    """
+    Generates a clean, written shortlist report summarizing the top N candidates
+    for this job. Run this after /score-resumes has completed.
+    """
+    try:
+        job = supabase.table("jobs").select("title, raw_text").eq("id", job_id).execute()
+        if not job.data:
+            return {"status": "error", "message": "Job not found"}
+        jd_text = job.data[0]["raw_text"]
+        job_title = job.data[0]["title"]
+
+        ranked = supabase.table("scores") \
+            .select("score, matched_skills, gaps, reasoning, resumes(filename, candidate_name)") \
+            .eq("job_id", job_id) \
+            .order("score", desc=True) \
+            .limit(top_n) \
+            .execute()
+
+        if not ranked.data:
+            return {"status": "error", "message": "No scored candidates found. Run /score-resumes first."}
+
+        candidates_text = ""
+        for i, candidate in enumerate(ranked.data, start=1):
+            name = candidate["resumes"]["candidate_name"]
+            candidates_text += f"\n{i}. {name} — Score: {candidate['score']}/100\n"
+            candidates_text += f"   Matched skills: {', '.join(candidate['matched_skills'])}\n"
+            candidates_text += f"   Gaps: {', '.join(candidate['gaps'])}\n"
+            candidates_text += f"   Notes: {candidate['reasoning']}\n"
+
+        model = genai.GenerativeModel("gemini-3.6-flash")
+        prompt = REPORT_PROMPT_TEMPLATE.format(jd_text=jd_text, candidates_text=candidates_text)
+        response = model.generate_content(prompt)
+
+        return {
+            "status": "success",
+            "job_title": job_title,
+            "report": response.text
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
