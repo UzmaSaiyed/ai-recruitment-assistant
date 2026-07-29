@@ -7,7 +7,7 @@ at http://localhost:8000 for this to work.
 import streamlit as st
 import requests
 
-BACKEND_URL = "http://localhost:8000"
+BACKEND_URL = "https://ai-recruitment-assistant-537j.onrender.com" 
 
 st.set_page_config(page_title="AI Recruitment Assistant", layout="wide")
 st.title("AI Recruitment & Document Assistant")
