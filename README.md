@@ -33,7 +33,7 @@ ai-recruitment-assistant/
   backend/
     main.py
     requirements.txt
-    .env.example
+    .env
   frontend/
     app.py
     requirements.txt
